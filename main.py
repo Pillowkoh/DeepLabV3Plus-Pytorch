@@ -19,6 +19,9 @@ from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
 
+from pathlib import Path
+from flops_counter import count_net_flops_and_params
+from prune_model import prune_model
 
 def get_argparser():
     parser = argparse.ArgumentParser()
@@ -79,6 +82,10 @@ def get_argparser():
                         help="epoch interval for eval (default: 100)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
+    parser.add_argument("--scratch", action='store_true', default=False,
+                        help="training model from scratch (default:False)")
+    parser.add_argument("--prune", type=float, default=0,
+                        help="prune model (default: 0)")
 
     # PASCAL VOC Options
     parser.add_argument("--year", type=str, default='2012',
@@ -205,6 +212,9 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     img_id += 1
 
         score = metrics.get_results()
+        if not opts.test_only:
+            mflops, mparams = count_net_flops_and_params(model, data_shape=(1,3,opts.crop_size, opts.crop_size))
+            print(f'MFLOPs: {mflops}, MParams: {mparams}')
     return score, ret_samples
 
 
@@ -244,25 +254,16 @@ def main():
           (opts.dataset, len(train_dst), len(val_dst)))
 
     # Set up model (all models are 'constructed at network.modeling)
-    model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+    if opts.scratch:
+        model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride, pretrained_backbone=False)
+    else:
+        model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
     utils.set_bn_momentum(model.backbone, momentum=0.01)
 
     # Set up metrics
     metrics = StreamSegMetrics(opts.num_classes)
-
-    # Set up optimizer
-    optimizer = torch.optim.SGD(params=[
-        {'params': model.backbone.parameters(), 'lr': 0.1 * opts.lr},
-        {'params': model.classifier.parameters(), 'lr': opts.lr},
-    ], lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    # optimizer = torch.optim.SGD(params=model.parameters(), lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    # torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.lr_decay_step, gamma=opts.lr_decay_factor)
-    if opts.lr_policy == 'poly':
-        scheduler = utils.PolyLR(optimizer, opts.total_itrs, power=0.9)
-    elif opts.lr_policy == 'step':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
 
     # Set up criterion
     # criterion = utils.get_loss(opts.loss_type)
@@ -274,13 +275,16 @@ def main():
     def save_ckpt(path):
         """ save current model
         """
-        torch.save({
-            "cur_itrs": cur_itrs,
-            "model_state": model.module.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "best_score": best_score,
-        }, path)
+        if opts.prune:
+            torch.save(model, path)
+        else:
+            torch.save({
+                "cur_itrs": cur_itrs,
+                "model_state": model.module.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_score": best_score,
+            }, path)
         print("Model saved as %s" % path)
 
     utils.mkdir('checkpoints')
@@ -289,23 +293,53 @@ def main():
     cur_itrs = 0
     cur_epochs = 0
     if opts.ckpt is not None and os.path.isfile(opts.ckpt):
-        # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
-        checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint["model_state"])
-        model = nn.DataParallel(model)
-        model.to(device)
-        if opts.continue_training:
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            scheduler.load_state_dict(checkpoint["scheduler_state"])
-            cur_itrs = checkpoint["cur_itrs"]
-            best_score = checkpoint['best_score']
-            print("Training state restored from %s" % opts.ckpt)
-        print("Model restored from %s" % opts.ckpt)
-        del checkpoint  # free memory
+        if opts.prune and opts.test_only:
+            model = torch.load(opts.ckpt, map_location=torch.device('cpu'))
+            # model = nn.DataParallel(model, device_ids=[0])
+            # model.to(device)
+        else:
+            # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
+            checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
+            model.load_state_dict(checkpoint["model_state"])
+            # model = nn.DataParallel(model)
+            # model.to(device)
+            if opts.continue_training:
+                optimizer.load_state_dict(checkpoint["optimizer_state"])
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
+                cur_itrs = checkpoint["cur_itrs"]
+                best_score = checkpoint['best_score']
+                print("Training state restored from %s" % opts.ckpt)
+            del checkpoint  # free memory
+            
+            if opts.prune:
+                model = prune_model(model, amount=opts.prune)
+            print("Model restored from %s" % opts.ckpt)
     else:
         print("[!] Retrain")
+        if opts.prune:
+            model = prune_model(model, amount=opts.prune)
+        # model = nn.DataParallel(model)
+        # model.to(device)
+
+    # Set up optimizer
+    if not opts.test_only:
+        optimizer = torch.optim.SGD(params=[
+            {'params': model.backbone.parameters(), 'lr': 0.1 * opts.lr},
+            {'params': model.classifier.parameters(), 'lr': opts.lr},
+        ], lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
+        # optimizer = torch.optim.SGD(params=model.parameters(), lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
+        # torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.lr_decay_step, gamma=opts.lr_decay_factor)
+        if opts.lr_policy == 'poly':
+            scheduler = utils.PolyLR(optimizer, opts.total_itrs, power=0.9)
+        elif opts.lr_policy == 'step':
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
+
+    # Using Multiple GPUs
+    if opts.prune and opts.test_only:
+        model = nn.DataParallel(model, device_ids=[0])
+    else:
         model = nn.DataParallel(model)
-        model.to(device)
+    model.to(device)
 
     # ==========   Train Loop   ==========#
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
@@ -320,6 +354,19 @@ def main():
         return
 
     interval_loss = 0
+
+    # Creating Save Paths
+    latest_ckpt_path = Path(f"checkpoints/latest_{opts.model}_{opts.dataset}_os{opts.output_stride}.pth")
+    best_ckpt_path = Path(f"checkpoints/best_{opts.model}_{opts.dataset}_os{opts.output_stride}.pth")
+
+    if opts.prune:
+        latest_ckpt_path = latest_ckpt_path.parent.joinpath(latest_ckpt_path.stem + f"_prune{opts.prune*100}.pth")
+        best_ckpt_path = best_ckpt_path.parent.joinpath(best_ckpt_path.stem + f"_prune{opts.prune*100}.pth")
+
+    if opts.scratch:
+        latest_ckpt_path = latest_ckpt_path.parent.joinpath(latest_ckpt_path.stem + "_scratch.pth")
+        best_ckpt_path = best_ckpt_path.parent.joinpath(best_ckpt_path.stem + "_scratch.pth")
+
     while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
@@ -348,8 +395,9 @@ def main():
                 interval_loss = 0.0
 
             if (cur_itrs) % opts.val_interval == 0:
-                save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
-                          (opts.model, opts.dataset, opts.output_stride))
+                # save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
+                #           (opts.model, opts.dataset, opts.output_stride))
+                save_ckpt(latest_ckpt_path)
                 print("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
@@ -358,8 +406,9 @@ def main():
                 print(metrics.to_str(val_score))
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
-                    save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
-                              (opts.model, opts.dataset, opts.output_stride))
+                    # save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
+                    #           (opts.model, opts.dataset, opts.output_stride))
+                    save_ckpt(best_ckpt_path)
 
                 if vis is not None:  # visualize validation score and samples
                     vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])
